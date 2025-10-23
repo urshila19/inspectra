@@ -1,0 +1,184 @@
+trigger: none
+
+parameters:
+  - name: target
+    displayName: "Target to build and test"
+    type: string
+    default: all
+    values:
+      - all
+      - inspectra-webserver
+      - inspectra-os
+      
+variables:
+  TAG: '3.0.2' 
+
+stages:
+  - stage: InspectraWebserver
+    displayName: "Inspectra Webserver Compliance"
+    condition: or(eq('${{parameters.target}}', 'all'), eq('${{parameters.target}}', 'inspectra-webserver'))
+    jobs:
+      - job: BuildAndTestWebserver
+        displayName: "Build and Run inspectra-webserver"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - script: |
+              echo 'Determining Docker image tag...'
+              if [ -z "$(TAG)" ]; then
+                if [ "$(Build.SourceTag)" != "" ]; then
+                  TAG=$(Build.SourceTag)
+                else
+                  SHORT_SHA=$(echo $(Build.SourceVersion) | cut -c1-7)
+                  TAG=$(Build.SourceBranchName)-$SHORT_SHA
+                fi
+                echo "##vso[task.setvariable variable=TAG]$TAG"
+                echo "Docker image tag set to: $TAG"
+              else
+                echo "TAG is already initialized with value: $(TAG)"
+              fi
+            displayName: 'Set Docker image tag'
+              
+          - script: |
+              echo "Setting up directory structure..."
+              mkdir -p $(Build.ArtifactStagingDirectory)/webserver_reports
+              mkdir -p $(Build.SourcesDirectory)/inspectra-webserver/test
+              # Create reports directory with proper permissions for Docker container
+              mkdir -p $(Build.ArtifactStagingDirectory)/reports
+              chmod -R 777 $(Build.ArtifactStagingDirectory)/reports
+              chmod -R 777 $(Build.ArtifactStagingDirectory)/webserver_reports
+              
+              # Show current user and permissions for debugging
+              echo "Current user: $(whoami)"
+              echo "User ID: $(id -u)"
+              echo "Group ID: $(id -g)"
+              ls -la $(Build.ArtifactStagingDirectory)/
+            displayName: "Prepare directories"
+
+          - script: |
+              echo "Building Inspectra Docker image..."
+              docker build -t inspectra-webserver:$(TAG) -f $(Build.SourcesDirectory)/Dockerfile $(Build.SourcesDirectory)
+              echo "Docker image inspectra-webserver:$(TAG) built successfully"
+            displayName: "Build Inspectra Docker image"
+
+          - script: |
+              # Test individual webserver scans and store results in subdirectories
+              mkdir -p $(Build.ArtifactStagingDirectory)/reports
+              
+              # Scan each webserver type individually
+              for webserver in apache nginx tomcat7 tomcat8 tomcat9 tomcat-windows ibm-httpd ibm-websphere iis jboss; do
+                echo "=== Scanning $webserver ==="
+                mkdir -p $(Build.ArtifactStagingDirectory)/reports/$webserver
+                chmod -R 777 $(Build.ArtifactStagingDirectory)/reports/$webserver
+                
+                # Run the container for this specific webserver type
+                docker run --rm \
+                  -v $(pwd)/inspectra-webserver/test/$webserver:/app/scan \
+                  -v $(Build.ArtifactStagingDirectory)/reports/$webserver:/app/reports \
+                  inspectra-webserver:$(TAG) webserver || echo "Scan completed with warnings (normal for security compliance)"
+                
+                # List generated reports
+                echo "Reports generated for $webserver:"
+                ls -la $(Build.ArtifactStagingDirectory)/reports/$webserver/ || echo "No reports directory found"
+              done
+              
+              # Generate summary
+              echo "=== Scan Summary ==="
+              find $(Build.ArtifactStagingDirectory)/reports -name "*.json" -o -name "*.html" -o -name "*.txt" | wc -l
+              echo "Total reports generated"
+              
+              echo "=== Report Structure ==="
+              find $(Build.ArtifactStagingDirectory)/reports -type f | head -20
+            displayName: "Run Inspectra webserver scans"
+
+          - publish: $(Build.ArtifactStagingDirectory)/reports
+            artifact: webserver_reports
+            displayName: "Publish webserver compliance reports"
+            
+          - script: |
+              echo "Listing all Docker images before save:"
+              docker images
+            displayName: "List Docker images"
+
+          - script: |
+              echo 'Saving Docker image as tar file'
+              docker save -o inspectra-webserver-$(TAG).tar inspectra-webserver:$(TAG)
+            displayName: 'Save Inspectra Docker image as tar file'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Inspectra Docker image tar file'
+            inputs:
+              targetPath: inspectra-webserver-$(TAG).tar
+              artifact: inspectra-docker-image
+
+  - stage: InspectraOS
+    displayName: "Inspectra OS Compliance"
+    condition: or(eq('${{parameters.target}}', 'all'), eq('${{parameters.target}}', 'inspectra-os'))
+    jobs:
+      - job: BuildAndTestOS
+        displayName: "Build and Run inspectra-os"
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - script: |
+              echo 'Determining Docker image tag...'
+              if [ -z "$(TAG)" ]; then
+                if [ "$(Build.SourceTag)" != "" ]; then
+                  TAG=$(Build.SourceTag)
+                else
+                  SHORT_SHA=$(echo $(Build.SourceVersion) | cut -c1-7)
+                  TAG=$(Build.SourceBranchName)-$SHORT_SHA
+                fi
+                echo "##vso[task.setvariable variable=TAG]$TAG"
+                echo "Docker image tag set to: $TAG"
+              else
+                echo "TAG is already initialized with value: $(TAG)"
+              fi
+            displayName: 'Set Docker image tag'
+              
+          - script: |
+              echo "Setting up directory structure..."
+              mkdir -p $(Build.ArtifactStagingDirectory)/os_reports
+              chmod -R 777 $(Build.ArtifactStagingDirectory)/os_reports
+              
+              # Show current user and permissions for debugging  
+              echo "Current user: $(whoami)"
+              echo "User ID: $(id -u)"
+              echo "Group ID: $(id -g)"
+            displayName: "Prepare directories"
+
+          - script: |
+              echo "Building InSpectra Docker image..."
+              docker build -t inspectra:$(TAG) -f $(Build.SourcesDirectory)/Dockerfile $(Build.SourcesDirectory)
+              echo "Docker image inspectra:$(TAG) built successfully"
+            displayName: "Build InSpectra Docker image"
+
+          - script: |
+              echo "Running inspectra OS compliance checks..."
+              
+              # Run Docker with OS compliance scan
+              docker run --rm \
+                -v $(Build.ArtifactStagingDirectory)/os_reports:/app/reports \
+                -e CHEF_LICENSE=accept \
+                -e INSPEC_LICENSE=accept \
+                inspectra:$(TAG) os
+              
+              # Show generated reports
+              echo "Generated OS compliance reports:"
+              find $(Build.ArtifactStagingDirectory)/os_reports -type f -name "*.json" | sort
+            displayName: "Run inspectra-os compliance checks"
+
+          - publish: $(Build.ArtifactStagingDirectory)/os_reports
+            artifact: os_reports
+            displayName: "Publish OS compliance reports"
+            
+          - script: |
+              echo 'Saving Docker image as tar file'
+              docker save -o inspectra-$(TAG).tar inspectra:$(TAG)
+            displayName: 'Save InSpectra Docker image as tar file'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish InSpectra Docker image tar file'
+            inputs:
+              targetPath: inspectra-$(TAG).tar
+              artifact: inspectra-docker-image
